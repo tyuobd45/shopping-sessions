@@ -1,77 +1,89 @@
 # Shopping Sessions
 
-An exact shopping-log pipeline for the Databricks Builders Buildathon track.
-A parallel Rust processor performs parsing, identity linking, event deduplication,
-sessionization, attribution and assists. Python and DuckDB encode the final tables
-as Parquet. The previous DuckDB implementation remains available as a native
-Python fallback when the compiled executable is absent.
+An exact native pipeline for the Databricks Builders Buildathon track. Rust handles
+CSV parsing, identity linking, deduplication, sessions, advertising attribution and
+assists, and writes Parquet directly. The scoring image starts the executable
+without a Python interpreter or intermediate CSV conversion.
 
 ## Build and run
 
-The root Dockerfile builds the Rust executable with Rust 1.85 and bundles it into
-a Python 3.12 image with `duckdb==1.5.6`. There are no Rust crate dependencies.
-The native executable targets x86-64-v3 for the scorer's amd64 Xeon machines.
+The Dockerfile builds the locked Cargo dependencies with Rust 1.85 and targets
+x86-64-v3, supported by the scorer's amd64 Xeon machines:
 
 ```sh
 docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
 ```
 
-The container command takes no arguments. The scorer supplies DATA_DIR, OUTPUT_DIR,
-SCRATCH_DIR, NCPU and MEM_GB. The input is mounted read-only at /data. Outputs are
-/output/user_daily/part-0.parquet and /output/campaign_daily/part-0.parquet; each
-`day` column is a Parquet DATE. Intermediate CSVs exist only in a private temporary
-folder under /scratch and are removed after conversion. No runtime network is
-required.
+The container takes no arguments. It reads DATA_DIR (default /data), writes under
+OUTPUT_DIR (default /output), and uses up to NCPU worker threads (maximum 8).
+Inputs are read-only; output consists of Parquet files directly in user_daily/
+and campaign_daily/. `day` is stored as the Parquet DATE logical type. No network,
+Python installation or temporary CSV files are required at run time.
 
-For the Python fallback, install `duckdb==1.5.6` and run:
-
-```sh
-DATA_DIR=/path/to/input OUTPUT_DIR=/path/to/output python3 pipeline/pipeline.py
-```
-
-On x86-64 Linux, a locally compiled executable can be selected explicitly:
+Build natively on x86-64 Linux:
 
 ```sh
-rustc --edition=2021 -O -C target-cpu=x86-64-v3 -C codegen-units=1 -C lto=thin pipeline/fast.rs -o /tmp/shopping-fast
-SHOPPING_FAST_ENGINE=/tmp/shopping-fast DATA_DIR=/path/to/input OUTPUT_DIR=/path/to/output python3 pipeline/pipeline.py
+RUSTFLAGS='-C target-cpu=x86-64-v3' cargo build --release --locked
+DATA_DIR=/path/to/input OUTPUT_DIR=/path/to/output NCPU=8 target/release/shopping-fast
 ```
 
-## Processing
+Parquet, bytes and JSON dependencies are pinned by Cargo.toml and Cargo.lock.
+The older Python/DuckDB pipeline remains in pipeline/pipeline.py for local
+comparison and macOS development; it is not the container entry point.
 
-- Read-only memory-mapped input and parallel parsing preserve the exact LF-only
-  CSV dialect, quoted fields, spaces, carriage returns and ASCII digit rules.
-- Union-find with path compression and union by size maps linked IDs to the
-  byte-wise smallest ID, including linked IDs absent from events and clicks.
-- Event IDs are hash-partitioned and deduplicated by earliest ingestion before
-  semantic filtering. Fingerprint collisions always compare full IDs and remain
-  distinct. An invalid earliest copy is never rescued by a later valid one.
-- Canonical users are partitioned among workers. Sorted events use gaps strictly
-  over 30 minutes; equal timestamps share a session, and all events count on the
-  UTC date of their session's start.
-- A sliding click window maintains exact 7-day inclusive eligibility. Latest-click
-  attribution uses the smallest click ID on a timestamp tie. Active campaign
-  counts record each assisting campaign once per session, including assist-only
-  campaign/day output rows.
-- Per-worker daily campaign arrays are merged; all arithmetic for totals uses
-  64-bit integers. Final CSV fields are explicitly typed during Parquet encoding.
+## Optimizations and correctness
+
+- AVX2 identifies field separators and quote positions together for short CSV
+  rows. Long rows use the scalar parser. Both preserve the LF-only dialect,
+  whitespace, carriage returns, quoted empty fields and malformed-row rejection.
+- Eight-digit numeric blocks use SWAR arithmetic with strict ASCII validation.
+  Longer and overflow-prone numbers use checked parsing.
+- Short alphanumeric IDs are encoded losslessly into integers. Other short IDs
+  preserve all bytes in 128-bit keys; long IDs retain the complete original value.
+  Case, spaces, leading zeros and embedded zero bytes remain distinct.
+- ID text lives in a contiguous arena rather than one allocation per name.
+  The arena is shared safely with the Parquet writer without copying each name.
+- Union-find maps every linked component to its byte-wise smallest ID, including
+  IDs absent from events and clicks. Unlinked IDs are normalized across workers.
+- Event IDs are hash-partitioned. Earliest ingestion wins before validation;
+  complete IDs resolve every fingerprint collision. An invalid earliest copy
+  cannot be rescued by a later valid copy.
+- The documented 14-day generated window fits exact 32-bit millisecond offsets.
+  The manifest range is checked before compact 64-bit user/time sort keys are
+  used. No timestamp precision is reduced or rounded.
+- Sorted canonical users use gaps strictly over 30 minutes. Equal timestamps
+  share sessions; cross-midnight sessions count on their UTC start date.
+- Sliding click windows maintain inclusive 7-day eligibility, latest-click
+  attribution with byte-wise click-ID ties, and one assist per active campaign
+  per session. Assist-only campaign/day rows are retained.
+- Per-worker outputs are written in parallel as Snappy Parquet. Numeric totals
+  remain 64-bit integers, and nullable top categories use definition levels.
 
 ## Validation
 
-- All 36 official edge-case fixtures pass with the native processor.
-- Both tables exactly match the published answer for the seed-1 1,000,000-event /
-  250,000-click public development dataset.
-- Both tables for a seed-17 20,000,000-event / 5,000,000-click generated dataset
-  exactly match the prior DuckDB implementation.
-- A Rust unit test deliberately exercises colliding fingerprints, distinct IDs,
-  and earliest-invalid-copy deduplication. Run it using `rustc --edition=2021
-  --test pipeline/fast.rs -o /tmp/shopping-tests` followed by `/tmp/shopping-tests`.
-- The optimized native run on that local 20M-event dataset took approximately
-  8.24 seconds end to end, compared with approximately 33.38 seconds for the
-  earlier DuckDB run on the same dataset. These are local development timings;
-  the official scorer uses different hardware and hidden data.
+- All 36 official edge-case fixtures pass using the native executable directly.
+- Both output tables exactly match the published 1M-event / 250K-click seed-1
+  development answer.
+- Both output tables on a generated seed-17 20M-event / 5M-click dataset exactly
+  match the previous DuckDB implementation.
+- Both tables also match the DuckDB implementation on a separately generated
+  seed-73 200K-event / 50K-click dataset.
+- Four Rust tests cover strict ASCII numeric parsing in every byte lane, SIMD
+  boundary and malformed-quote behavior against the scalar parser, lossless ID
+  key boundaries, and full-ID resolution of deliberate fingerprint collisions.
 
-The previous submission at commit 3cb6c1de220d94d1a7b654efb44930055792ae3c
-passed official practice scoring in 38.30 seconds. The native version still
-requires official container/hidden-data evaluation. No dates, input IDs, dataset
-seeds, fixture outputs or reference-answer lookups are hard-coded. See rules.md
-for the published task specification. Large datasets and outputs are omitted.
+```sh
+RUSTFLAGS='-C target-cpu=x86-64-v3' cargo test --release --locked
+```
+
+A paired local benchmark on the same 20M-event dataset measured the previous
+native/Python-conversion version at 7.820 and 8.293 seconds, and this direct
+Parquet version at 5.441 and 4.171 seconds. These are development timings, not
+leaderboard scores; the official hardware and hidden dataset differ.
+
+The previous native submission at commit b2c792fa605e3ff25408c8cc536863205ac1723d
+passed official practice evaluation in 6.58 seconds. This revised image still
+requires official container and hidden-data evaluation. The prior submission
+remains available in repository history. No dataset dates, user IDs, fixture
+answers, seeds or reference-answer lookups are hard-coded. See rules.md for the
+published task specification.
