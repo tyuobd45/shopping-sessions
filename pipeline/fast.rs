@@ -9,8 +9,58 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
+use std::sync::Arc;
+use bytes::Bytes;
+use parquet::basic::{Compression,Encoding};
+use parquet::data_type::{ByteArray,ByteArrayType,Int32Type,Int64Type};
+use parquet::file::properties::{EnabledStatistics,WriterProperties};
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
 
 type Map<K,V> = HashMap<K,V,BuildHasherDefault<BlockHasher>>;
+#[derive(Default)]
+struct IdLookup {compact:Map<u64,u32>,short:Map<u128,u32>,long:Map<Vec<u8>,u32>}
+const fn id_alphabet()->[u8;256] {
+    let mut codes=[255u8;256];let mut i=0;
+    while i<10 {codes[b'0' as usize+i]=i as u8;i+=1;}
+    i=0;while i<26 {codes[b'a' as usize+i]=(10+i) as u8;codes[b'A' as usize+i]=(36+i) as u8;i+=1;}
+    codes[b'_' as usize]=62;codes[b'-' as usize]=63;codes
+}
+const ID_ALPHABET:[u8;256]=id_alphabet();
+impl IdLookup {
+    fn with_capacity(count:usize)->Self {
+        Self{compact:Map::with_capacity_and_hasher(count,Default::default()),short:Map::default(),long:Map::default()}
+    }
+    #[inline]
+    fn encoded(value:&[u8])->Option<u64> {
+        if value.len()>10 {return None;}
+        let mut key=value.len() as u64;
+        for &byte in value {
+            let code=ID_ALPHABET[byte as usize];
+            if code==255 {return None;}
+            key=(key<<6)|code as u64;
+        }
+        Some(key)
+    }
+    #[inline]
+    fn packed(value:&[u8])->u128 {
+        let mut bytes=[0u8;16];bytes[0]=value.len() as u8;
+        bytes[1..value.len()+1].copy_from_slice(value);
+        u128::from_le_bytes(bytes)
+    }
+    #[inline]
+    fn get(&self,value:&[u8])->Option<&u32> {
+        if let Some(key)=Self::encoded(value) {self.compact.get(&key)}
+        else if value.len()<=15 {self.short.get(&Self::packed(value))} else {self.long.get(value)}
+    }
+    fn insert(&mut self,value:&[u8],id:u32) {
+        if let Some(key)=Self::encoded(value) {self.compact.insert(key,id);}
+        else if value.len()<=15 {self.short.insert(Self::packed(value),id);}
+        else {self.long.insert(value.to_vec(),id);}
+    }
+    fn clear(&mut self) {self.compact.clear();self.short.clear();self.long.clear();}
+    fn shrink_to_fit(&mut self) {self.compact.shrink_to_fit();self.short.shrink_to_fit();self.long.shrink_to_fit();}
+}
 #[derive(Default)]
 struct BlockHasher(u64);
 impl Hasher for BlockHasher {
@@ -44,7 +94,7 @@ const DAY:i64=86_400_000;
 const WEEK:i64=7*DAY;
 const UNKNOWN:u32=1<<31;
 
-fn fields<const N:usize>(line:&[u8])->Option<[&[u8];N]> {
+fn fields_scalar<const N:usize>(line:&[u8])->Option<[&[u8];N]> {
     let mut result=[&[][..];N];
     let mut split=line.split(|&c| c==b',');
     for slot in &mut result {
@@ -59,8 +109,74 @@ fn fields<const N:usize>(line:&[u8])->Option<[&[u8];N]> {
     if split.next().is_some() {return None;}
     Some(result)
 }
+
+#[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+fn fields_vector<const N:usize>(line:&[u8])->Option<[&[u8];N]> {
+    use std::arch::x86_64::*;
+    let mut commas=0u128;
+    let mut quotes=0u128;
+    let mut offset=0;
+    // Every vector load stays within its source slice. The short final block
+    // is copied into a zero-filled local array, so no mmap overread is possible.
+    unsafe {
+        let comma=_mm256_set1_epi8(b',' as i8);
+        let quote=_mm256_set1_epi8(b'"' as i8);
+        while offset+32<=line.len() {
+            let block=_mm256_loadu_si256(line.as_ptr().add(offset).cast());
+            commas|=(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block,comma)) as u32 as u128)<<offset;
+            quotes|=(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block,quote)) as u32 as u128)<<offset;
+            offset+=32;
+        }
+        if offset<line.len() {
+            let mut tail=[0u8;32];
+            tail[..line.len()-offset].copy_from_slice(&line[offset..]);
+            let block=_mm256_loadu_si256(tail.as_ptr().cast());
+            commas|=(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block,comma)) as u32 as u128)<<offset;
+            quotes|=(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block,quote)) as u32 as u128)<<offset;
+        }
+    }
+    if commas.count_ones() as usize!=N-1 {return None;}
+    let mut out=[&[][..];N];
+    let mut start=0;
+    let mut expected_quotes=0u128;
+    for (i,slot) in out.iter_mut().enumerate() {
+        let end=if i==N-1 {line.len()} else {let p=commas.trailing_zeros() as usize;commas&=commas-1;p};
+        if start<end&&line[start]==b'"' {
+            if end-start<2||line[end-1]!=b'"' {return None;}
+            expected_quotes|=(1u128<<start)|(1u128<<(end-1));
+            *slot=&line[start+1..end-1];
+        } else {*slot=&line[start..end];}
+        start=end+1;
+    }
+    if quotes!=expected_quotes {return None;}
+    Some(out)
+}
+
+#[inline]
+fn fields<const N:usize>(line:&[u8])->Option<[&[u8];N]> {
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+    if line.len()>=32&&line.len()<=128 {return fields_vector::<N>(line);}
+    fields_scalar::<N>(line)
+}
+
+#[inline]
+fn eight_digits(s:&[u8])->Option<u64> {
+    let word=u64::from_le_bytes(s[..8].try_into().unwrap());
+    if ((word.wrapping_add(0x4646464646464646)|word.wrapping_sub(0x3030303030303030))&0x8080808080808080)!=0 {return None;}
+    let mut digits=word&0x0f0f0f0f0f0f0f0f;
+    digits=(digits.wrapping_mul(10)+(digits>>8))&0x00ff00ff00ff00ff;
+    digits=(digits.wrapping_mul(100)+(digits>>16))&0x0000ffff0000ffff;
+    Some((digits.wrapping_mul(10000)+(digits>>32))&0xffffffff)
+}
+
+#[inline]
 fn number(s:&[u8])->Option<u64> {
     if s.is_empty() {return None;}
+    if s.len()<=16 {
+        let (mut n,rest)=if s.len()>=8 {(eight_digits(s)?,&s[8..])} else {(0,s)};
+        for &c in rest {if !c.is_ascii_digit(){return None;}n=n*10+(c-b'0') as u64;}
+        return Some(n);
+    }
     let mut n=0u64;
     for &c in s {
         if !c.is_ascii_digit() {return None;}
@@ -173,13 +289,25 @@ fn tasks(files:&[MappedFile])->Vec<&[u8]> {
     }
     out
 }
-struct Ids {names:Vec<Vec<u8>>, lookup:Map<Vec<u8>,u32>, parent:Vec<u32>, sizes:Vec<u32>, minimum:Vec<u32>}
+#[derive(Default)]
+struct NameStore {data:Vec<u8>,ranges:Vec<(usize,usize)>}
+impl NameStore {
+    fn len(&self)->usize {self.ranges.len()}
+    fn push(&mut self,name:&[u8]) {
+        let start=self.data.len();self.data.extend_from_slice(name);self.ranges.push((start,self.data.len()));
+    }
+}
+impl std::ops::Index<usize> for NameStore {
+    type Output=[u8];
+    fn index(&self,index:usize)->&[u8] {let(a,b)=self.ranges[index];&self.data[a..b]}
+}
+struct Ids {names:NameStore, lookup:IdLookup, parent:Vec<u32>, sizes:Vec<u32>, minimum:Vec<u32>}
 impl Ids {
-    fn new()->Self {Self{names:Vec::new(),lookup:Map::default(),parent:Vec::new(),sizes:Vec::new(),minimum:Vec::new()}}
+    fn new()->Self {Self{names:NameStore::default(),lookup:IdLookup::default(),parent:Vec::new(),sizes:Vec::new(),minimum:Vec::new()}}
     fn intern(&mut self,s:&[u8])->u32 {
         if let Some(&id)=self.lookup.get(s) {return id;}
         let id=self.names.len() as u32;
-        self.names.push(s.to_vec()); self.lookup.insert(s.to_vec(),id);
+        self.names.push(s); self.lookup.insert(s,id);
         self.parent.push(id); self.sizes.push(1); self.minimum.push(id); id
     }
     fn find(&mut self,mut id:u32)->u32 {
@@ -200,13 +328,18 @@ impl Ids {
     }
     fn canonicalize(&mut self) {
         let map:Vec<u32>=(0..self.names.len()).map(|i|{let r=self.find(i as u32);self.minimum[r as usize]}).collect();
-        for v in self.lookup.values_mut() {*v=map[*v as usize];}
+        for v in self.lookup.compact.values_mut().chain(self.lookup.short.values_mut()).chain(self.lookup.long.values_mut()) {*v=map[*v as usize];}
         self.parent.clear();self.sizes.clear();self.minimum.clear();
     }
 }
 fn link_ids(data:&Path)->io::Result<Ids> {
-    let mut ids=Ids::new();
-    for path in csv_paths(&data.join("links"))? {
+    let paths=csv_paths(&data.join("links"))?;
+    let bytes:usize=paths.iter().map(|p|fs::metadata(p).map(|m|m.len() as usize)).collect::<io::Result<Vec<_>>>()?.into_iter().sum();
+    let capacity=(bytes/16).min(8000000);
+    let mut ids=Ids::new();ids.lookup=IdLookup::with_capacity(capacity);
+    ids.names.data.reserve(bytes/2);ids.names.ranges.reserve(capacity);
+    ids.parent.reserve(capacity);ids.sizes.reserve(capacity);ids.minimum.reserve(capacity);
+    for path in paths {
         let bytes=fs::read(path)?;
         for line in body(&bytes).split(|&c|c==b'\n') {
             if let Some([a,b])=fields::<2>(line) {
@@ -230,28 +363,37 @@ fn dimension(path:&Path)->io::Result<Dimension> {
     Ok(out)
 }
 #[derive(Clone,Copy)]
-struct RawEvent<'a>{id:&'a[u8], ts:i64, ingest:i64, user:u32, category:u32, price:u32, valid:bool}
+struct RawEvent<'a>{id:&'a[u8], ingest:i64, ts:u32, user:u32, category:u32, price:u32}
 #[derive(Clone,Copy)]
-struct Event{ts:i64,user:u32,category:u32,price:u32}
+struct Event{key:u64,category:u32,price:u32}
+impl Event {
+    #[inline] fn user(&self)->u32 {(self.key>>32) as u32}
+    #[inline] fn ts(&self,lower:i64)->i64 {lower+(self.key as u32) as i64}
+}
 #[derive(Clone,Copy)]
 struct Click<'a>{id:&'a[u8],ts:i64,user:u32,campaign:u32}
 struct Parsed<'a>{events:Vec<Vec<RawEvent<'a>>>,clicks:Vec<Click<'a>>,unknown:Vec<&'a[u8]>}
-fn local_user<'a>(s:&'a[u8],known:&Map<Vec<u8>,u32>,local:&mut Map<&'a[u8],u32>,names:&mut Vec<&'a[u8]>)->u32 {
+fn local_user<'a>(s:&'a[u8],known:&IdLookup,local:&mut IdLookup,names:&mut Vec<&'a[u8]>)->u32 {
     if let Some(&id)=known.get(s) {return id;}
     if let Some(&id)=local.get(s) {return id|UNKNOWN;}
     let id=names.len() as u32;names.push(s);local.insert(s,id);id|UNKNOWN
 }
-fn parse_parallel<'a>(event_tasks:&[&'a[u8]],click_tasks:&[&'a[u8]],known:&Map<Vec<u8>,u32>,
+fn parse_parallel<'a>(event_tasks:&[&'a[u8]],click_tasks:&[&'a[u8]],known:&IdLookup,
     products:&Map<Vec<u8>,u32>,campaigns:&Map<Vec<u8>,u32>,unknown_category:u32,
     lower:i64,upper:i64,ncpu:usize)->Vec<Parsed<'a>> {
     let queue=AtomicUsize::new(0);
+    let rows=event_tasks.iter().map(|t|t.len()).sum::<usize>()/64;
+    let events_per_shard=rows/ncpu/ncpu+1;
+    let clicks_per_worker=click_tasks.iter().map(|t|t.len()).sum::<usize>()/32/ncpu+1;
+    let users_per_worker=(rows/ncpu/12).min(1000000);
     thread::scope(|scope| {
         let mut handles=Vec::new();
         for _ in 0..ncpu {
             let queue=&queue;
             handles.push(scope.spawn(move||{
-                let mut out=Parsed{events:(0..ncpu).map(|_|Vec::new()).collect(),clicks:Vec::new(),unknown:Vec::new()};
-                let mut local=Map::default();
+                let mut out=Parsed{events:(0..ncpu).map(|_|Vec::with_capacity(events_per_shard)).collect(),
+                    clicks:Vec::with_capacity(clicks_per_worker),unknown:Vec::with_capacity(users_per_worker/2)};
+                let mut local=IdLookup::with_capacity(users_per_worker);
                 loop {
                     let job=queue.fetch_add(1,Ordering::Relaxed);
                     if job>=event_tasks.len()+click_tasks.len(){break;}
@@ -269,10 +411,10 @@ fn parse_parallel<'a>(event_tasks:&[&'a[u8]],click_tasks:&[&'a[u8]],known:&Map<V
                             if valid&&ingest.saturating_sub(t)>DAY {valid=false;}
                             let price=if kind==2 {number(f[6]).filter(|&n|n>=1&&n<=10000000).map(|n|n as u32)} else {Some(0)};
                             valid=valid&&price.is_some();
-                            let user=if valid {local_user(f[1],known,&mut local,&mut out.unknown)} else {0};
+                            let user=if valid {local_user(f[1],known,&mut local,&mut out.unknown)} else {u32::MAX};
                             let category=if valid&&price.unwrap_or(0)>0 {*products.get(f[5]).unwrap_or(&unknown_category)} else {unknown_category};
                             let shard=(fingerprint(f[0]) as usize)%ncpu;
-                            out.events[shard].push(RawEvent{id:f[0],ts:t,ingest,user,category,price:price.unwrap_or(0),valid});
+                            out.events[shard].push(RawEvent{id:f[0],ts:if valid {(t-lower) as u32} else {0},ingest,user,category,price:price.unwrap_or(0)});
                         }
                     } else {
                         for line in click_tasks[job-event_tasks.len()].split(|&c|c==b'\n') {
@@ -320,7 +462,7 @@ fn dedup(parts:Vec<Vec<RawEvent<'_>>>)->Vec<Event> {
     // sequential rather than millions of random reads through hash buckets.
     let mut result=Vec::with_capacity(selected.len());
     for r in selected {
-        if r.valid {result.push(Event{ts:r.ts,user:r.user,category:r.category,price:r.price});}
+        if r.user!=u32::MAX {result.push(Event{key:((r.user as u64)<<32)|r.ts as u64,category:r.category,price:r.price});}
     }
     result
 }
@@ -351,32 +493,33 @@ impl<'a> Ads<'a> {
         for &campaign in self.active.keys() {totals[campaign as usize*days+day].assisted+=1;}
     }
 }
-fn aggregate(mut events:Vec<Event>,mut clicks:Vec<Click<'_>>,categories:&[Vec<u8>],days:usize,base_day:i64,campaigns:usize)->Results {
-    events.sort_unstable_by_key(|e|(e.user,e.ts));
+fn aggregate(mut events:Vec<Event>,mut clicks:Vec<Click<'_>>,categories:&[Vec<u8>],days:usize,base_day:i64,campaigns:usize,lower:i64)->Results {
+    events.sort_unstable_by_key(|e|e.key);
     clicks.sort_unstable_by(|a,b|a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then(a.id.cmp(b.id)));
     let mut out=Results{users:Vec::new(),campaigns:vec![CampaignDay::default();(campaigns+1)*days]};
     let mut ei=0;let mut ci=0;
     while ei<events.len() {
-        let user=events[ei].user;
+        let user=events[ei].user();
         let begin=ei;
-        while ei<events.len()&&events[ei].user==user {ei+=1;}
+        while ei<events.len()&&events[ei].user()==user {ei+=1;}
         while ci<clicks.len()&&clicks[ci].user<user {ci+=1;}
         let cb=ci;
         while ci<clicks.len()&&clicks[ci].user==user {ci+=1;}
         let mut ads=Ads{clicks:&clicks[cb..ci],left:0,right:0,latest:0,active:Map::default()};
         let mut daily:Vec<UserDay>=(0..days).map(|_|UserDay::default()).collect();
-        let mut start=events[begin].ts;
+        let mut start=events[begin].ts(lower);
         let mut previous=start;
         let mut day=(start.div_euclid(DAY)-base_day) as usize;
         let mut revenue=0u64;
         daily[day].sessions+=1;
         for event in &events[begin..ei] {
-            if event.ts-previous>1800000 {
+            let ts=event.ts(lower);
+            if ts-previous>1800000 {
                 ads.session(start,day,revenue,days,campaigns as u32,&mut out.campaigns);
-                start=event.ts;day=(start.div_euclid(DAY)-base_day) as usize;
+                start=ts;day=(start.div_euclid(DAY)-base_day) as usize;
                 revenue=0;daily[day].sessions+=1;
             }
-            previous=event.ts;
+            previous=ts;
             let d=&mut daily[day];d.events+=1;d.revenue+=event.price as u64;
             revenue+=event.price as u64;
             if event.price>0 {
@@ -396,13 +539,112 @@ fn aggregate(mut events:Vec<Event>,mut clicks:Vec<Click<'_>>,categories:&[Vec<u8
 fn quoted(w:&mut impl Write,s:&[u8])->io::Result<()> {
     w.write_all(b"\"")?;w.write_all(s)?;w.write_all(b"\"")
 }
+enum ColumnValues {
+    Text(Vec<ByteArray>,Option<Vec<i16>>),
+    Date(Vec<i32>),
+    Integer(Vec<i64>),
+}
+fn write_columns(writer:&mut SerializedFileWriter<File>,columns:Vec<ColumnValues>)->parquet::errors::Result<()> {
+    let mut group=writer.next_row_group()?;
+    for values in columns {
+        let mut column=group.next_column()?.expect("fixed output schema");
+        match values {
+            ColumnValues::Text(values,levels)=>{column.typed::<ByteArrayType>().write_batch(&values,levels.as_deref(),None)?;},
+            ColumnValues::Date(values)=>{column.typed::<Int32Type>().write_batch(&values,None,None)?;},
+            ColumnValues::Integer(values)=>{column.typed::<Int64Type>().write_batch(&values,None,None)?;},
+        }
+        column.close()?;
+    }
+    group.close()?;Ok(())
+}
+fn parquet_properties()->Arc<WriterProperties> {
+    Arc::new(WriterProperties::builder().set_compression(Compression::SNAPPY)
+        .set_dictionary_enabled(false).set_encoding(Encoding::PLAIN)
+        .set_statistics_enabled(EnabledStatistics::None).build())
+}
+fn write_user_parquet(path:PathBuf,rows:Vec<UserRow>,names:&[ByteArray],categories:&[ByteArray],base_day:i64)->parquet::errors::Result<()> {
+    let schema=Arc::new(parse_message_type("message user_daily {
+        REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE);
+        REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents;
+        OPTIONAL BYTE_ARRAY top_category (UTF8); }")?);
+    let mut writer=SerializedFileWriter::new(File::create(path)?,schema,parquet_properties())?;
+    for chunk in rows.chunks(65536) {
+        let mut users=Vec::with_capacity(chunk.len());let mut dates=Vec::with_capacity(chunk.len());
+        let mut sessions=Vec::with_capacity(chunk.len());let mut events=Vec::with_capacity(chunk.len());
+        let mut revenue=Vec::with_capacity(chunk.len());let mut top=Vec::new();let mut levels=Vec::with_capacity(chunk.len());
+        for r in chunk {
+            users.push(names[r.user as usize].clone());dates.push((base_day+r.day as i64) as i32);
+            sessions.push(r.sessions as i64);events.push(r.events as i64);revenue.push(r.revenue as i64);
+            if let Some(c)=r.category {levels.push(1);top.push(categories[c as usize].clone());} else {levels.push(0);}
+        }
+        write_columns(&mut writer,vec![ColumnValues::Text(users,None),ColumnValues::Date(dates),
+            ColumnValues::Integer(sessions),ColumnValues::Integer(events),ColumnValues::Integer(revenue),ColumnValues::Text(top,Some(levels))])?;
+    }
+    writer.close()?;Ok(())
+}
+fn write_direct_parquet(output:&Path,results:Vec<Results>,names:NameStore,categories:Vec<Vec<u8>>,
+    campaigns:Dimension,base_day:i64,days:usize)->parquet::errors::Result<()> {
+    fs::create_dir_all(output.join("user_daily"))?;fs::create_dir_all(output.join("campaign_daily"))?;
+    let arena=Bytes::from(names.data);
+    let names:Vec<ByteArray>=names.ranges.into_iter().map(|(a,b)|ByteArray::from(arena.slice(a..b))).collect();
+    let categories:Vec<ByteArray>=categories.into_iter().map(ByteArray::from).collect();
+    let mut total=vec![CampaignDay::default();(campaigns.names.len()+1)*days];
+    let mut rows=Vec::new();
+    for result in results {
+        rows.push(result.users);
+        for (to,from) in total.iter_mut().zip(result.campaigns) {
+            to.sessions+=from.sessions;to.purchasing+=from.purchasing;to.revenue+=from.revenue;to.assisted+=from.assisted;
+        }
+    }
+    thread::scope(|scope|->parquet::errors::Result<()> {
+        let mut handles=Vec::new();
+        for (part,rows) in rows.into_iter().enumerate() {
+            let path=output.join("user_daily").join(format!("part-{part}.parquet"));
+            let names=&names;let categories=&categories;
+            handles.push(scope.spawn(move||write_user_parquet(path,rows,names,categories,base_day)));
+        }
+        for h in handles {h.join().expect("Parquet worker failed")?;}
+        Ok(())
+    })?;
+    let schema=Arc::new(parse_message_type("message campaign_daily {
+        REQUIRED BYTE_ARRAY campaign_id (UTF8); REQUIRED BYTE_ARRAY channel (UTF8);
+        REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions;
+        REQUIRED INT64 revenue_cents; REQUIRED INT64 assisted_sessions; }")?);
+    let mut writer=SerializedFileWriter::new(File::create(output.join("campaign_daily/part-0.parquet"))?,schema,parquet_properties())?;
+    let mut ids=Vec::new();let mut channels=Vec::new();let mut dates=Vec::new();let mut sessions=Vec::new();
+    let mut purchasing=Vec::new();let mut revenue=Vec::new();let mut assisted=Vec::new();
+    for (campaign,chunk) in total.chunks(days).enumerate() {
+        let (id,channel)=if campaign==campaigns.names.len() {(ByteArray::from(b"organic".to_vec()),ByteArray::from(b"organic".to_vec()))}
+            else {(ByteArray::from(campaigns.names[campaign].clone()),ByteArray::from(campaigns.labels[campaign].clone()))};
+        for (day,r) in chunk.iter().enumerate() {
+            if r.sessions==0&&r.assisted==0 {continue;}
+            ids.push(id.clone());channels.push(channel.clone());dates.push((base_day+day as i64) as i32);
+            sessions.push(r.sessions as i64);purchasing.push(r.purchasing as i64);revenue.push(r.revenue as i64);assisted.push(r.assisted as i64);
+        }
+    }
+    if !ids.is_empty() {write_columns(&mut writer,vec![ColumnValues::Text(ids,None),ColumnValues::Text(channels,None),ColumnValues::Date(dates),
+        ColumnValues::Integer(sessions),ColumnValues::Integer(purchasing),ColumnValues::Integer(revenue),ColumnValues::Integer(assisted)])?;}
+    writer.close()?;Ok(())
+}
 fn run()->Result<(),Box<dyn std::error::Error>> {
     let args:Vec<String>=std::env::args().collect();
-    if args.len()!=6 {return Err("usage: fast-engine DATA WORK LOWER_MS UPPER_MS NCPU".into());}
-    let data=Path::new(&args[1]);let work=Path::new(&args[2]);
-    let lower:i64=args[3].parse()?;let upper:i64=args[4].parse()?;let ncpu:usize=args[5].parse::<usize>()?.clamp(1,8);
+    let legacy=args.len()==6;
+    let (data,work,lower,upper,ncpu)=if legacy {
+        (PathBuf::from(&args[1]),PathBuf::from(&args[2]),args[3].parse::<i64>()?,args[4].parse::<i64>()?,args[5].parse::<usize>()?.clamp(1,8))
+    } else {
+        let data=PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_|args.get(1).cloned().unwrap_or("/data".into())));
+        let output=PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_|args.get(2).cloned().unwrap_or("/output".into())));
+        let manifest:serde_json::Value=serde_json::from_slice(&fs::read(data.join("manifest.json"))?)?;
+        let lower=timestamp(manifest["window_start"].as_str().ok_or("missing window_start")?.as_bytes()).ok_or("invalid window_start")?;
+        let upper=timestamp(manifest["window_end"].as_str().ok_or("missing window_end")?.as_bytes()).ok_or("invalid window_end")?;
+        let ncpu=std::env::var("NCPU").ok().and_then(|n|n.parse::<usize>().ok()).unwrap_or(8).clamp(1,8);
+        (data,output,lower,upper,ncpu)
+    };
+    // The documented generated window is fourteen days. Relative milliseconds
+    // preserve every timestamp exactly while keeping a row's sort key compact.
+    if upper<=lower||upper-lower>u32::MAX as i64 {return Err("event window must fit 32-bit millisecond offsets".into());}
     let started=Instant::now();
-    let mut ids=link_ids(data)?;
+    let mut ids=link_ids(&data)?;
     let products=dimension(&data.join("products.csv"))?;
     let campaigns=dimension(&data.join("campaigns.csv"))?;
     let mut categories:Vec<Vec<u8>>=Vec::new();let mut category_ids=Map::default();
@@ -429,7 +671,7 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
     for part in &parsed {
         let mapping:Vec<u32>=part.unknown.iter().map(|&name| {
             *extra.entry(name).or_insert_with(|| {
-                let id=ids.names.len() as u32;ids.names.push(name.to_vec());id
+                let id=ids.names.len() as u32;ids.names.push(name);id
             })
         }).collect();
         mappings.push(mapping);
@@ -440,7 +682,7 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
         let handles:Vec<_>=parsed.into_iter().zip(mappings).map(|(mut part,mapping)| {
             scope.spawn(move|| {
                 for event in part.events.iter_mut().flatten() {
-                    if event.user&UNKNOWN!=0 {event.user=mapping[(event.user&!UNKNOWN) as usize];}
+                    if event.user!=u32::MAX&&event.user&UNKNOWN!=0 {event.user=mapping[(event.user&!UNKNOWN) as usize];}
                 }
                 for click in &mut part.clicks {
                     if click.user&UNKNOWN!=0 {click.user=mapping[(click.user&!UNKNOWN) as usize];}
@@ -464,17 +706,22 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
     let mut event_shards:Vec<Vec<Event>>=(0..ncpu).map(|_|Vec::new()).collect();
-    for part in unique {for event in part {event_shards[event.user as usize%ncpu].push(event);}}
+    for part in unique {for event in part {event_shards[event.user() as usize%ncpu].push(event);}}
     eprintln!("[native {:.2}s] event IDs deduplicated",started.elapsed().as_secs_f64());
     let base_day=lower.div_euclid(DAY);let days=((upper-1).div_euclid(DAY)-base_day+1) as usize;
     let results=thread::scope(|scope| {
         let handles:Vec<_>=event_shards.into_iter().zip(click_shards).map(|(e,c)| {
             let categories=&categories;let count=campaigns.names.len();
-            scope.spawn(move||aggregate(e,c,categories,days,base_day,count))
+            scope.spawn(move||aggregate(e,c,categories,days,base_day,count,lower))
         }).collect();
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
     eprintln!("[native {:.2}s] sessions and campaigns aggregated",started.elapsed().as_secs_f64());
+    if !legacy {
+        write_direct_parquet(&work,results,ids.names,categories,campaigns,base_day,days)?;
+        eprintln!("[native {:.2}s] Parquet output complete",started.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let dates:Vec<String>=(0..days).map(|i|{let(y,m,d)=civil_from_days(base_day+i as i64);format!("{y:04}-{m:02}-{d:02}")}).collect();
     let mut users=BufWriter::with_capacity(1024*1024,File::create(work.join("user_daily.csv"))?);
     writeln!(users,"user_id,day,sessions,events,revenue_cents,top_category")?;
@@ -514,11 +761,56 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn short_id_keys_preserve_length_bytes_and_long_ids() {
+        let values:[&[u8];9]=[b"a",b"a\0",b"a\0\0",b"123456789012345",b"1234567890123456",b" A\tB\r",b"A",b"-_",b"0000000000"];
+        let mut map=IdLookup::default();
+        for (i,&value) in values.iter().enumerate() {map.insert(value,i as u32);}
+        assert_eq!(map.compact.len()+map.short.len()+map.long.len(),values.len());
+        for (i,&value) in values.iter().enumerate() {assert_eq!(map.get(value),Some(&(i as u32)));}
+    }
+    #[test]
+    fn decimal_swar_rejects_every_non_ascii_digit_in_every_lane() {
+        for lane in 0..8 {
+            for byte in 0u16..256 {
+                let mut s=*b"11111111";s[lane]=byte as u8;
+                let expected=if s.iter().all(u8::is_ascii_digit) {
+                    Some(std::str::from_utf8(&s).unwrap().parse::<u64>().unwrap())
+                } else {None};
+                assert_eq!(number(&s),expected,"lane={lane} byte={byte}");
+            }
+        }
+        for s in ["00000000000000000000000000001791071890000", "18446744073709551615",
+                  "18446744073709551616", "1791071890000.0", "-5", "２５０"] {
+            let expected=if !s.is_empty()&&s.bytes().all(|c|c.is_ascii_digit()) {s.parse::<u64>().ok()} else {None};
+            assert_eq!(number(s.as_bytes()),expected);
+        }
+    }
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+    #[test]
+    fn vector_csv_matches_scalar_at_vector_boundaries_and_invalid_quotes() {
+        fn check<const N:usize>() {
+            let base=vec!["a";N].join(",").into_bytes();
+            for size in [31usize,32,33,63,64,65,95,96,97,127,128,129,160] {
+                let mut line=vec![b'x';size-base.len()];line.extend_from_slice(&base);
+                assert_eq!(fields::<N>(&line),fields_scalar::<N>(&line));
+                for pos in 0..line.len() {
+                    let saved=line[pos];
+                    for byte in [b'"',b',',b'\r',b' ',0,255] {
+                        line[pos]=byte;
+                        assert_eq!(fields::<N>(&line),fields_scalar::<N>(&line),"size={size} pos={pos}");
+                    }
+                    line[pos]=saved;
+                }
+            }
+        }
+        check::<7>();check::<4>();check::<2>();
+    }
+    #[test]
     fn fingerprint_collisions_keep_distinct_ids_and_earliest_invalid_copy() {
         let ids:[&[u8];3]=[b"a",b"a\0",b"a\0\0"];
         assert_eq!(fingerprint(ids[0]),fingerprint(ids[1]));
         assert_eq!(fingerprint(ids[0]),fingerprint(ids[2]));
-        let row=|id,ingest,price,valid|RawEvent{id,ts:0,ingest,user:0,category:0,price,valid};
+        let row=|id,ingest,price,valid|RawEvent{id,ts:0,ingest,user:if valid {0} else {u32::MAX},category:0,price};
         let parts=vec![vec![row(ids[0],10,10,true),row(ids[1],20,20,true)],
                        vec![row(ids[1],5,0,false),row(ids[2],10,30,true)]];
         let mut prices:Vec<u32>=dedup(parts).iter().map(|e|e.price).collect();
