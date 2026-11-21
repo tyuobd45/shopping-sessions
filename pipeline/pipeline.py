@@ -5,6 +5,7 @@ No fixture answers, fixed dates, users, campaigns or seeds are used.
 """
 from __future__ import annotations
 import csv
+from datetime import datetime, timezone
 import gc
 import json
 import mmap
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import subprocess
 import tempfile
 import time
 import duckdb
@@ -259,5 +261,49 @@ def main():
         log('wrote both Parquet tables')
 
 
+def native_main(engine):
+    """Run the compiled processor, then encode its typed outputs as Parquet."""
+    started = time.perf_counter()
+    data = Path(os.environ.get('DATA_DIR', sys.argv[1] if len(sys.argv)>1 else '/data'))
+    output = Path(os.environ.get('OUTPUT_DIR', sys.argv[2] if len(sys.argv)>2 else '/output'))
+    scratch = os.environ.get('SCRATCH_DIR')
+    if scratch:
+        Path(scratch).mkdir(parents=True, exist_ok=True)
+    cpus = max(1, min(8, int(os.environ.get('NCPU', os.cpu_count() or 1))))
+    manifest = json.loads((data/'manifest.json').read_text())
+    def epoch(value):
+        return int(datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp())*1000
+    schemas = {
+        'user_daily': {'user_id':'VARCHAR', 'day':'DATE', 'sessions':'BIGINT',
+                       'events':'BIGINT', 'revenue_cents':'BIGINT', 'top_category':'VARCHAR'},
+        'campaign_daily': {'campaign_id':'VARCHAR', 'channel':'VARCHAR', 'day':'DATE',
+                           'sessions':'BIGINT', 'purchasing_sessions':'BIGINT',
+                           'revenue_cents':'BIGINT', 'assisted_sessions':'BIGINT'},
+    }
+    with tempfile.TemporaryDirectory(prefix='shopping-native-', dir=scratch) as temporary:
+        subprocess.run([str(engine), str(data), temporary,
+                        str(epoch(manifest['window_start'])), str(epoch(manifest['window_end'])),
+                        str(cpus)], check=True)
+        con = duckdb.connect()
+        con.execute(f'SET threads={cpus}')
+        con.execute(f"SET memory_limit={literal(str(max(1, int(os.environ.get('MEM_GB','8'))//2))+'GB')}")
+        con.execute(f"SET temp_directory={literal(Path(temporary)/'spill')}")
+        con.execute('SET preserve_insertion_order=false')
+        for table, schema in schemas.items():
+            folder = output/table
+            folder.mkdir(parents=True, exist_ok=True)
+            columns = ','.join(f'{literal(k)}:{literal(v)}' for k,v in schema.items())
+            con.execute(f"COPY (SELECT * FROM read_csv({literal(Path(temporary)/(table+'.csv'))},"
+                        f"header=true, auto_detect=false, columns={{{columns}}},"
+                        f"nullstr='', allow_quoted_nulls=false)) TO "
+                        f"{literal(folder/'part-0.parquet')} (FORMAT PARQUET)")
+        con.close()
+    print(f'[{time.perf_counter()-started:.2f}s] native pipeline completed', file=sys.stderr)
+
+
 if __name__=='__main__':
-    main()
+    engine = Path(os.environ.get('SHOPPING_FAST_ENGINE', '/app/fast-engine'))
+    if engine.is_file():
+        native_main(engine)
+    else:
+        main()
