@@ -1,5 +1,4 @@
-//! Exact, parallel Shopping Sessions processor. Uses only the Rust standard library.
-//! Writes two intermediate CSVs; the Python entry point converts them to Parquet.
+//! Exact parallel Shopping Sessions processor with direct native Parquet output.
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::fs::{self, File};
@@ -53,10 +52,17 @@ impl IdLookup {
         if let Some(key)=Self::encoded(value) {self.compact.get(&key)}
         else if value.len()<=15 {self.short.get(&Self::packed(value))} else {self.long.get(value)}
     }
+    #[cfg(test)]
     fn insert(&mut self,value:&[u8],id:u32) {
         if let Some(key)=Self::encoded(value) {self.compact.insert(key,id);}
         else if value.len()<=15 {self.short.insert(Self::packed(value),id);}
         else {self.long.insert(value.to_vec(),id);}
+    }
+    fn get_or_insert_with(&mut self,value:&[u8],create:impl FnOnce()->u32)->u32 {
+        if let Some(key)=Self::encoded(value) {*self.compact.entry(key).or_insert_with(create)}
+        else if value.len()<=15 {*self.short.entry(Self::packed(value)).or_insert_with(create)}
+        else if let Some(&id)=self.long.get(value) {id}
+        else {let id=create();self.long.insert(value.to_vec(),id);id}
     }
     fn clear(&mut self) {self.compact.clear();self.short.clear();self.long.clear();}
     fn shrink_to_fit(&mut self) {self.compact.shrink_to_fit();self.short.shrink_to_fit();self.long.shrink_to_fit();}
@@ -93,6 +99,8 @@ fn fingerprint(s:&[u8])->u64 { let mut h=BlockHasher::default(); h.write(s); h.f
 const DAY:i64=86_400_000;
 const WEEK:i64=7*DAY;
 const UNKNOWN:u32=1<<31;
+const LOCAL_BITS:u32=28;
+const LOCAL_MASK:u32=(1<<LOCAL_BITS)-1;
 
 fn fields_scalar<const N:usize>(line:&[u8])->Option<[&[u8];N]> {
     let mut result=[&[][..];N];
@@ -235,6 +243,13 @@ fn timestamp(s:&[u8])->Option<i64> {
     }
     Some(t)
 }
+
+fn lines(bytes:&[u8])->impl Iterator<Item=&[u8]> {
+    let mut start=0;
+    memchr::memchr_iter(b'\n',bytes).chain(std::iter::once(bytes.len())).map(move|end| {
+        let line=&bytes[start..end];start=end+1;line
+    })
+}
 fn csv_paths(folder:&Path)->io::Result<Vec<PathBuf>> {
     let mut out=Vec::new();
     if folder.exists() {
@@ -282,7 +297,7 @@ fn tasks(files:&[MappedFile])->Vec<&[u8]> {
         while start<bytes.len() {
             let mut end=(start+8*1024*1024).min(bytes.len());
             if end<bytes.len() {
-                end=match bytes[end..].iter().position(|&c|c==b'\n') {Some(p)=>end+p+1,None=>bytes.len()};
+                end=match memchr::memchr(b'\n',&bytes[end..]) {Some(p)=>end+p+1,None=>bytes.len()};
             }
             out.push(&bytes[start..end]); start=end;
         }
@@ -305,10 +320,10 @@ struct Ids {names:NameStore, lookup:IdLookup, parent:Vec<u32>, sizes:Vec<u32>, m
 impl Ids {
     fn new()->Self {Self{names:NameStore::default(),lookup:IdLookup::default(),parent:Vec::new(),sizes:Vec::new(),minimum:Vec::new()}}
     fn intern(&mut self,s:&[u8])->u32 {
-        if let Some(&id)=self.lookup.get(s) {return id;}
-        let id=self.names.len() as u32;
-        self.names.push(s); self.lookup.insert(s,id);
-        self.parent.push(id); self.sizes.push(1); self.minimum.push(id); id
+        self.lookup.get_or_insert_with(s,|| {
+            let id=self.names.len() as u32;
+            self.names.push(s);self.parent.push(id);self.sizes.push(1);self.minimum.push(id);id
+        })
     }
     fn find(&mut self,mut id:u32)->u32 {
         while self.parent[id as usize]!=id {
@@ -341,7 +356,7 @@ fn link_ids(data:&Path)->io::Result<Ids> {
     ids.parent.reserve(capacity);ids.sizes.reserve(capacity);ids.minimum.reserve(capacity);
     for path in paths {
         let bytes=fs::read(path)?;
-        for line in body(&bytes).split(|&c|c==b'\n') {
+        for line in lines(body(&bytes)) {
             if let Some([a,b])=fields::<2>(line) {
                 if !a.is_empty()&&!b.is_empty() {ids.join(a,b);}
             }
@@ -353,7 +368,7 @@ struct Dimension {lookup:Map<Vec<u8>,u32>,names:Vec<Vec<u8>>,labels:Vec<Vec<u8>>
 fn dimension(path:&Path)->io::Result<Dimension> {
     let bytes=fs::read(path)?;
     let mut out=Dimension{lookup:Map::default(),names:Vec::new(),labels:Vec::new()};
-    for line in body(&bytes).split(|&c|c==b'\n') {
+    for line in lines(body(&bytes)) {
         if let Some([a,b])=fields::<2>(line) {
             if a.is_empty(){continue;}
             let id=out.names.len() as u32;
@@ -373,32 +388,35 @@ impl Event {
 #[derive(Clone,Copy)]
 struct Click<'a>{id:&'a[u8],ts:i64,user:u32,campaign:u32}
 struct Parsed<'a>{events:Vec<Vec<RawEvent<'a>>>,clicks:Vec<Click<'a>>,unknown:Vec<&'a[u8]>}
-fn local_user<'a>(s:&'a[u8],known:&IdLookup,local:&mut IdLookup,names:&mut Vec<&'a[u8]>)->u32 {
+fn local_user<'a>(s:&'a[u8],known:&IdLookup,local:&mut IdLookup,names:&mut Vec<&'a[u8]>,worker:usize)->u32 {
     if let Some(&id)=known.get(s) {return id;}
-    if let Some(&id)=local.get(s) {return id|UNKNOWN;}
-    let id=names.len() as u32;names.push(s);local.insert(s,id);id|UNKNOWN
+    local.get_or_insert_with(s,|| {
+        let id=u32::try_from(names.len()).expect("user count fits u32");
+        assert!(id<=LOCAL_MASK,"per-worker user count exceeds compact index");names.push(s);id
+    })|UNKNOWN|((worker as u32)<<LOCAL_BITS)
 }
 fn parse_parallel<'a>(event_tasks:&[&'a[u8]],click_tasks:&[&'a[u8]],known:&IdLookup,
     products:&Map<Vec<u8>,u32>,campaigns:&Map<Vec<u8>,u32>,unknown_category:u32,
     lower:i64,upper:i64,ncpu:usize)->Vec<Parsed<'a>> {
     let queue=AtomicUsize::new(0);
     let rows=event_tasks.iter().map(|t|t.len()).sum::<usize>()/64;
-    let events_per_shard=rows/ncpu/ncpu+1;
+    let dedup_shards=ncpu.next_power_of_two()*16;
+    let events_per_shard=rows/ncpu/dedup_shards+1;
     let clicks_per_worker=click_tasks.iter().map(|t|t.len()).sum::<usize>()/32/ncpu+1;
     let users_per_worker=(rows/ncpu/12).min(1000000);
     thread::scope(|scope| {
         let mut handles=Vec::new();
-        for _ in 0..ncpu {
+        for worker in 0..ncpu {
             let queue=&queue;
             handles.push(scope.spawn(move||{
-                let mut out=Parsed{events:(0..ncpu).map(|_|Vec::with_capacity(events_per_shard)).collect(),
+                let mut out=Parsed{events:(0..dedup_shards).map(|_|Vec::with_capacity(events_per_shard)).collect(),
                     clicks:Vec::with_capacity(clicks_per_worker),unknown:Vec::with_capacity(users_per_worker/2)};
                 let mut local=IdLookup::with_capacity(users_per_worker);
                 loop {
                     let job=queue.fetch_add(1,Ordering::Relaxed);
                     if job>=event_tasks.len()+click_tasks.len(){break;}
                     if job<event_tasks.len() {
-                        for line in event_tasks[job].split(|&c|c==b'\n') {
+                        for line in lines(event_tasks[job]) {
                             let Some(f)=fields::<7>(line) else {continue;};
                             if f[0].is_empty(){continue;}
                             let ingest=timestamp(f[3]).expect("ingest_ts is valid F1 by specification");
@@ -411,19 +429,19 @@ fn parse_parallel<'a>(event_tasks:&[&'a[u8]],click_tasks:&[&'a[u8]],known:&IdLoo
                             if valid&&ingest.saturating_sub(t)>DAY {valid=false;}
                             let price=if kind==2 {number(f[6]).filter(|&n|n>=1&&n<=10000000).map(|n|n as u32)} else {Some(0)};
                             valid=valid&&price.is_some();
-                            let user=if valid {local_user(f[1],known,&mut local,&mut out.unknown)} else {u32::MAX};
+                            let user=if valid {local_user(f[1],known,&mut local,&mut out.unknown,worker)} else {u32::MAX};
                             let category=if valid&&price.unwrap_or(0)>0 {*products.get(f[5]).unwrap_or(&unknown_category)} else {unknown_category};
-                            let shard=(fingerprint(f[0]) as usize)%ncpu;
+                            let hash=fingerprint(f[0]);let shard=(hash as usize)&(dedup_shards-1);
                             out.events[shard].push(RawEvent{id:f[0],ts:if valid {(t-lower) as u32} else {0},ingest,user,category,price:price.unwrap_or(0)});
                         }
                     } else {
-                        for line in click_tasks[job-event_tasks.len()].split(|&c|c==b'\n') {
+                        for line in lines(click_tasks[job-event_tasks.len()]) {
                             let Some(f)=fields::<4>(line) else {continue;};
                             if f[0].is_empty()||f[1].is_empty(){continue;}
                             let Some(&campaign)=campaigns.get(f[2]) else {continue;};
                             let Some(ts)=timestamp(f[3]) else {continue;};
                             if ts<lower-WEEK||ts>=upper {continue;}
-                            let user=local_user(f[1],known,&mut local,&mut out.unknown);
+                            let user=local_user(f[1],known,&mut local,&mut out.unknown,worker);
                             out.clicks.push(Click{id:f[0],ts,user,campaign});
                         }
                     }
@@ -434,7 +452,7 @@ fn parse_parallel<'a>(event_tasks:&[&'a[u8]],click_tasks:&[&'a[u8]],known:&IdLoo
         handles.into_iter().map(|h|h.join().unwrap()).collect()
     })
 }
-fn dedup(parts:Vec<Vec<RawEvent<'_>>>)->Vec<Event> {
+fn dedup(parts:Vec<Vec<RawEvent<'_>>>,mappings:&[Vec<u32>])->Vec<Event> {
     let count=parts.iter().map(Vec::len).sum();
     let mut index:Map<u64,usize>=Map::with_capacity_and_hasher(count,Default::default());
     let mut selected:Vec<&RawEvent<'_>>=Vec::with_capacity(count);
@@ -462,7 +480,10 @@ fn dedup(parts:Vec<Vec<RawEvent<'_>>>)->Vec<Event> {
     // sequential rather than millions of random reads through hash buckets.
     let mut result=Vec::with_capacity(selected.len());
     for r in selected {
-        if r.user!=u32::MAX {result.push(Event{key:((r.user as u64)<<32)|r.ts as u64,category:r.category,price:r.price});}
+        if r.user!=u32::MAX {
+            let user=if r.user&UNKNOWN!=0 {mappings[((r.user&!UNKNOWN)>>LOCAL_BITS) as usize][(r.user&LOCAL_MASK) as usize]} else {r.user};
+            result.push(Event{key:((user as u64)<<32)|r.ts as u64,category:r.category,price:r.price});
+        }
     }
     result
 }
@@ -493,8 +514,28 @@ impl<'a> Ads<'a> {
         for &campaign in self.active.keys() {totals[campaign as usize*days+day].assisted+=1;}
     }
 }
+fn sort_events(events:&mut Vec<Event>) {
+    if events.len()<2048 {events.sort_unstable_by_key(|e|e.key);return;}
+    let significant=events.iter().fold(0u64,|bits,e|bits|e.key);
+    let bits=64-significant.leading_zeros();
+    let mut source=std::mem::take(events);
+    let mut target=vec![Event{key:0,category:0,price:0};source.len()];
+    for shift in (0..bits).step_by(11) {
+        let mut counts=[0usize;2048];
+        for event in &source {counts[((event.key>>shift)&2047) as usize]+=1;}
+        if counts.iter().any(|&n|n==source.len()) {continue;}
+        let mut offset=0;
+        for count in &mut counts {let n=*count;*count=offset;offset+=n;}
+        for &event in &source {
+            let next=&mut counts[((event.key>>shift)&2047) as usize];
+            target[*next]=event;*next+=1;
+        }
+        std::mem::swap(&mut source,&mut target);
+    }
+    *events=source;
+}
 fn aggregate(mut events:Vec<Event>,mut clicks:Vec<Click<'_>>,categories:&[Vec<u8>],days:usize,base_day:i64,campaigns:usize,lower:i64)->Results {
-    events.sort_unstable_by_key(|e|e.key);
+    sort_events(&mut events);
     clicks.sort_unstable_by(|a,b|a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then(a.id.cmp(b.id)));
     let mut out=Results{users:Vec::new(),campaigns:vec![CampaignDay::default();(campaigns+1)*days]};
     let mut ei=0;let mut ci=0;
@@ -666,33 +707,30 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
     // Intern only those IDs in a small borrowed-key map, avoiding millions of
     // repeated lookups and allocations in the much larger alias dictionary.
     ids.lookup.clear();ids.lookup.shrink_to_fit();
-    let mut extra:Map<&[u8],u32>=Map::default();
+    let unknown_count=parsed.iter().map(|p|p.unknown.len()).sum::<usize>();
+    ids.names.ranges.reserve(unknown_count);ids.names.data.reserve(unknown_count*10);
+    let mut extra=IdLookup::with_capacity(unknown_count);
     let mut mappings=Vec::with_capacity(parsed.len());
     for part in &parsed {
         let mapping:Vec<u32>=part.unknown.iter().map(|&name| {
-            *extra.entry(name).or_insert_with(|| {
-                let id=ids.names.len() as u32;ids.names.push(name);id
-            })
+            extra.get_or_insert_with(name,|| {let id=ids.names.len() as u32;ids.names.push(name);id})
         }).collect();
         mappings.push(mapping);
     }
     drop(extra);
     let click_count:usize=parsed.iter().map(|p|p.clicks.len()).sum();
     let normalized=thread::scope(|scope| {
-        let handles:Vec<_>=parsed.into_iter().zip(mappings).map(|(mut part,mapping)| {
+        let handles:Vec<_>=parsed.into_iter().zip(&mappings).map(|(mut part,mapping)| {
             scope.spawn(move|| {
-                for event in part.events.iter_mut().flatten() {
-                    if event.user!=u32::MAX&&event.user&UNKNOWN!=0 {event.user=mapping[(event.user&!UNKNOWN) as usize];}
-                }
                 for click in &mut part.clicks {
-                    if click.user&UNKNOWN!=0 {click.user=mapping[(click.user&!UNKNOWN) as usize];}
+                    if click.user&UNKNOWN!=0 {click.user=mapping[(click.user&LOCAL_MASK) as usize];}
                 }
                 part.unknown.clear();part
             })
         }).collect();
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
-    let mut shards:Vec<Vec<Vec<RawEvent<'_>>>>=(0..ncpu).map(|_|Vec::new()).collect();
+    let mut shards:Vec<Vec<Vec<RawEvent<'_>>>>=(0..ncpu.next_power_of_two()*16).map(|_|Vec::new()).collect();
     let mut click_shards:Vec<Vec<Click<'_>>>=(0..ncpu).map(|_|Vec::with_capacity(click_count/ncpu+1)).collect();
     for part in normalized {
         for (to,from) in shards.iter_mut().zip(part.events) {to.push(from);}
@@ -701,11 +739,22 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
         }
     }
     eprintln!("[native {:.2}s] input parsed",started.elapsed().as_secs_f64());
+    let mut dedup_jobs:Vec<Vec<Vec<Vec<RawEvent<'_>>>>>=(0..ncpu).map(|_|Vec::new()).collect();
+    for (i,shard) in shards.into_iter().enumerate() {dedup_jobs[i%ncpu].push(shard);}
     let unique=thread::scope(|scope|{
-        let handles:Vec<_>=shards.into_iter().map(|s|scope.spawn(move||dedup(s))).collect();
+        let handles:Vec<_>=dedup_jobs.into_iter().map(|jobs| {
+            let mappings=&mappings;
+            scope.spawn(move|| {
+                let capacity=jobs.iter().flatten().map(Vec::len).sum();
+                let mut events=Vec::with_capacity(capacity);
+                for job in jobs {events.extend(dedup(job,mappings));}
+                events
+            })
+        }).collect();
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
-    let mut event_shards:Vec<Vec<Event>>=(0..ncpu).map(|_|Vec::new()).collect();
+    let event_capacity=unique.iter().map(Vec::len).sum::<usize>()/ncpu;
+    let mut event_shards:Vec<Vec<Event>>=(0..ncpu).map(|_|Vec::with_capacity(event_capacity+event_capacity/2+1)).collect();
     for part in unique {for event in part {event_shards[event.user() as usize%ncpu].push(event);}}
     eprintln!("[native {:.2}s] event IDs deduplicated",started.elapsed().as_secs_f64());
     let base_day=lower.div_euclid(DAY);let days=((upper-1).div_euclid(DAY)-base_day+1) as usize;
@@ -761,6 +810,44 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn newline_iterator_matches_lf_only_split() {
+        for input in [b"".as_slice(),b"a",b"a\n",b"\n",b"a\r\nb\rc",b"a\n\nb\n",b"\0\n\0"] {
+            assert_eq!(lines(input).collect::<Vec<_>>(),input.split(|&b|b==b'\n').collect::<Vec<_>>());
+        }
+        for len in 0..260 {
+            let input:Vec<u8>=(0..len).map(|i|((i*47+len*17)%256) as u8).collect();
+            assert_eq!(lines(&input).collect::<Vec<_>>(),input.split(|&b|b==b'\n').collect::<Vec<_>>());
+        }
+    }
+    #[test]
+    fn radix_sort_preserves_full_width_keys_and_every_payload() {
+        for len in [0usize,1,2047,2048,5000,10001] {
+            for mode in 0..4 {
+                let mut seed=0xc214862af783e19bu64;
+                let mut values:Vec<Event>=(0..len).map(|i| {
+                    seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;
+                    let key=match mode {0=>seed,1=>seed&0x1fffffffffffff,2=>seed%8,_=>0};
+                    Event{key,category:i as u32,price:(i*31) as u32}
+                }).collect();
+                let mut expected:Vec<_>=values.iter().map(|e|(e.key,e.category,e.price)).collect();
+                expected.sort_unstable();sort_events(&mut values);
+                assert!(values.windows(2).all(|w|w[0].key<=w[1].key));
+                let mut actual:Vec<_>=values.iter().map(|e|(e.key,e.category,e.price)).collect();
+                actual.sort_unstable();assert_eq!(actual,expected);
+            }
+        }
+    }
+    #[test]
+    fn deferred_user_mapping_keeps_worker_indices_separate() {
+        let mappings:Vec<Vec<u32>>=(0..8).map(|i|vec![10+i,100+i]).collect();
+        let names:[&[u8];8]=[b"e0",b"e1",b"e2",b"e3",b"e4",b"e5",b"e6",b"e7"];
+        let rows:Vec<_>=names.iter().enumerate().map(|(worker,&id)|RawEvent {
+            id,ingest:0,ts:worker as u32,user:UNKNOWN|((worker as u32)<<LOCAL_BITS)|1,category:0,price:1
+        }).collect();
+        let mut users:Vec<_>=dedup(vec![rows],&mappings).iter().map(Event::user).collect();
+        users.sort_unstable();assert_eq!(users,(100..108).collect::<Vec<_>>());
+    }
+    #[test]
     fn short_id_keys_preserve_length_bytes_and_long_ids() {
         let values:[&[u8];9]=[b"a",b"a\0",b"a\0\0",b"123456789012345",b"1234567890123456",b" A\tB\r",b"A",b"-_",b"0000000000"];
         let mut map=IdLookup::default();
@@ -813,7 +900,7 @@ mod tests {
         let row=|id,ingest,price,valid|RawEvent{id,ts:0,ingest,user:if valid {0} else {u32::MAX},category:0,price};
         let parts=vec![vec![row(ids[0],10,10,true),row(ids[1],20,20,true)],
                        vec![row(ids[1],5,0,false),row(ids[2],10,30,true)]];
-        let mut prices:Vec<u32>=dedup(parts).iter().map(|e|e.price).collect();
+        let mut prices:Vec<u32>=dedup(parts,&[]).iter().map(|e|e.price).collect();
         prices.sort_unstable();
         assert_eq!(prices,vec![10,30]);
     }
