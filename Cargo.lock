@@ -463,6 +463,7 @@ name = "shopping-sessions-native"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "memchr",
  "parquet",
  "serde_json",
 ]
